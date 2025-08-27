@@ -12,7 +12,6 @@ from lean_quantizer import *
 from modelutils import *
 from quant import *
 from leanquant import replace_with_quantizers
-from awq_quantizer import calibrate_llm_awq, apply_llm_awq_equalization
 
 
 def get_llama(model):
@@ -278,6 +277,96 @@ def _compute_input_scale_simple(mean_abs, std_abs, max_abs, alpha=0.5, clip_rati
     s = base / base.mean()
     return s
 
+def awq_s_to_row_params(W: torch.Tensor, s: torch.Tensor):
+    """
+    將 AWQ 的 per-column scale s (len=in_features) 轉為 per-row 的 pseudo (scale, zero)
+    - 對 Linear 權重 W[out, in]：回傳 awq_scale_row[out]、awq_zero_row[out]=0
+    - 若拿到的 s 不是 per-col，就做合理的 broadcast/mean fallback
+    """
+    rows, cols = W.shape
+    if s is None:
+        awq_scale_row = torch.ones(rows, device=W.device, dtype=W.dtype)
+    else:
+        s = s.to(W.device)
+        if s.ndim == 1 and s.numel() == cols:
+            # 以列均值把 per-col s 映到每個 row（同一層的 row 共用一個代表性值）
+            s_mean = s.mean()
+            awq_scale_row = torch.full((rows,), s_mean, device=W.device, dtype=W.dtype)
+        elif s.ndim == 1 and s.numel() == rows:
+            # 已經是 per-row
+            awq_scale_row = s.to(W.dtype)
+        else:
+            # 其他情況就取整體均值
+            awq_scale_row = torch.full((rows,), s.float().mean().to(W.device), device=W.device, dtype=W.dtype)
+
+    awq_zero_row = torch.zeros_like(awq_scale_row)
+    return awq_scale_row, awq_zero_row
+
+@torch.no_grad()
+def _make_awq_scaled_weight(W: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """
+    將 AWQ 的 per-input-channel scale s 套到權重上，得到等價的 W_awq。
+    W: [out, in]
+    s: 長度要等於 in 或 out（某些 Linear 變種權重轉置），其餘情況回傳 W.clone()。
+    """
+    rows, cols = W.shape
+    if s is None:
+        return W.clone()
+
+    if s.ndim != 1:
+        s = s.reshape(-1)
+
+    if s.numel() == cols:          # 標準 Linear: per-column
+        return W * s.view(1, cols)
+    elif s.numel() == rows:        # 可能是 Conv1D-like 轉置存法
+        return W * s.view(rows, 1)
+    else:
+        # 不相符就保守退回原權重
+        return W.clone()
+
+
+@torch.no_grad()
+def _get_perrow_quant_params(W: torch.Tensor, wbits: int, sym: bool) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    對 W 做 per-row 量化參數擬合，回傳 (scale_row, zero_row, maxq)。
+    兩者 shape 都是 [rows]，給量化時再 view 成 [rows, 1] 做 broadcast。
+    """
+    q = Quantizer()
+    q.configure(wbits, perchannel=True, sym=sym, mse=False)
+    q.find_params(W, weight=True)  # 會做每個 out channel 一個參數
+    return q.scale.detach(), q.zero.detach(), q.maxq
+
+
+@torch.no_grad()
+def _as_row_params(scale: torch.Tensor, zero: torch.Tensor, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    把一維的 per-row 向量 reshape 成可 broadcast 的 [rows, 1]。
+    """
+    scale = scale.reshape(rows, 1).contiguous()
+    zero  = zero.reshape(rows, 1).contiguous()
+    return scale, zero
+
+
+@torch.no_grad()
+def fuse_params_perrow(
+    sLQ_row: torch.Tensor, zLQ_row: torch.Tensor,
+    sAWQ_row: torch.Tensor, zAWQ_row: torch.Tensor,
+    awq_weight: float = 0.5
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    以 awq_weight 在 [0,1] 做線性融合；回傳仍為 [rows, 1] 形狀（可直接 broadcast 到 [rows, cols]）。
+    zero 會四捨五入成整數型別（保持和原 zero dtype 一致）。
+    """
+    awq_weight = float(max(0.0, min(1.0, awq_weight)))
+    fs = (1.0 - awq_weight) * sLQ_row + awq_weight * sAWQ_row
+
+    # zero 是整數格點位置；保持型別、做 round
+    dtype_zero = zLQ_row.dtype
+    fz = (1.0 - awq_weight) * zLQ_row.to(torch.float32) + awq_weight * zAWQ_row.to(torch.float32)
+    fz = torch.round(fz).to(dtype_zero)
+
+    return fs, fz
+
 
 # ---- Modified llama_sequential with AWQ+LQ fusion ----
 @torch.no_grad()
@@ -385,66 +474,46 @@ def llama_sequential(model, dataloader, dev):
                 print(i, name)
                 print("Quantizing (AWQ+LQ fusion) ...")
 
-                W = subset[name].weight.data.clone()
-                # compute AWQ per-input-channel scale if we have stats for this module
+
+                W = subset[name].weight.data.clone()     # [out, in]
+                rows, cols = W.shape
+
+                # 1) AWQ 的 per-input scale s（多半為 per-col），先產生等價的 W_awq
                 key = f"{subset[name].__class__.__name__}_{id(subset[name])}"
                 s = None
                 if key in awq_stats:
                     st = awq_stats[key]
                     mean_abs = st["mean_abs"].to(W.device)
-                    std_abs = st["std_abs"].to(W.device)
-                    max_abs = st["max_abs"].to(W.device)
-                    # AWQ input-scale (columns)
+                    std_abs  = st["std_abs"].to(W.device)
+                    max_abs  = st["max_abs"].to(W.device)
                     s = _compute_input_scale_simple(
                         mean_abs, std_abs, max_abs, alpha=0.6, clip_ratio=0.01
-                    )
-                    # reshape for column scaling
-                    if W.ndim == 2:
-                        if W.shape[1] == s.numel():
-                            W_awq = W * s.view(1, -1)
-                        elif W.shape[0] == s.numel():
-                            # possible Conv1D-like storage
-                            W_awq = W * s.view(-1, 1)
-                        else:
-                            W_awq = W.clone()
-                    else:
-                        W_awq = W.clone()
-                else:
-                    W_awq = W.clone()
+                    )  # => 一維向量，通常長度 = in (= cols)
 
-                # compute Quantizer params on original and AWQ-scaled weights
-                qA = Quantizer()
-                qA.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
-                qA.find_params(W, weight=True)
+                W_awq = _make_awq_scaled_weight(W, s)  # 保證形狀仍為 [rows, cols]
 
-                qB = Quantizer()
-                qB.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
-                qB.find_params(W_awq, weight=True)
+                # 2) 純 LQ（在原始 W 上）→ 取得 per-row 參數
+                sLQ_vec, zLQ_vec, maxq = _get_perrow_quant_params(W, args.wbits, args.sym)
+                sLQ_row, zLQ_row = _as_row_params(sLQ_vec, zLQ_vec, rows)   # [rows, 1]
 
-                # fuse scale and zero_point (simple average, equal weights)
-                # both qA.scale and qB.scale are per-channel tensors
-                fused_scale = 0.5 * (qA.scale + qB.scale)
-                fused_zero = 0.5 * (qA.zero + qB.zero)
-                # ensure integer zero (round)
-                fused_zero = torch.round(fused_zero).to(qA.zero.dtype)
+                # 3) 純 AWQ（使用等價的 W_awq）→ 取得 per-row 參數
+                sAWQ_vec, zAWQ_vec, _ = _get_perrow_quant_params(W_awq, args.wbits, args.sym)
+                sAWQ_row, zAWQ_row = _as_row_params(sAWQ_vec, zAWQ_vec, rows)  # [rows, 1]
 
-                # quantize original weights using fused params
-                maxq = qA.maxq
-                Wq = quantize(
-                    subset[name].weight.data, fused_scale, fused_zero, maxq
-                ).to(subset[name].weight.data.dtype)
+                # 4) 融合（可調權重），預設等權
+                awq_weight = getattr(args, "awq_weight", 0.5)
+                fs, fz = fuse_params_perrow(sLQ_row, zLQ_row, sAWQ_row, zAWQ_row, awq_weight=awq_weight)  # [rows,1],[rows,1]
 
-                # replace weight in-place with quantized values (so subsequent layers see quantized weights)
+                # 5) 量化到整個 W（broadcast 到 [rows, cols]）
+                Wq = quantize(W, fs, fz, maxq).to(W.dtype)
                 subset[name].weight.data.copy_(Wq)
 
                 # For compatibility with original pipeline, fill quantizers dict using leanquant's grid/codes if available
                 # We'll attempt to produce a minimal (grid, codes) using existing leanquant machinery if possible.
                 try:
-                    # run the leanquant grid learning once with frozen quantizer params to get grid+codes
-                    leanquant[name].quantizer.scale = fused_scale
-                    leanquant[name].quantizer.zero = fused_zero
-                    leanquant[name].quantizer.maxq = maxq
-                    # call fasterquant to compute quant_grid & quantized_codes -- quieter mode
+                    leanquant[name].quantizer.scale = sLQ_vec  # 這裡要看你希望 grid 代表哪個參考（可改成 fs.squeeze(1)）
+                    leanquant[name].quantizer.zero  = zLQ_vec
+                    leanquant[name].quantizer.maxq  = maxq
                     leanquant[name].fasterquant(
                         blocksize=args.block_size,
                         percdamp=args.percdamp,
@@ -454,16 +523,11 @@ def llama_sequential(model, dataloader, dev):
                         args=args,
                     )
                     if isinstance(args.exponent, float):
-                        quantizers[name] = (
-                            leanquant[name].quant_grid,
-                            leanquant[name].quantized_codes,
-                        )
+                        quantizers[name] = (leanquant[name].quant_grid, leanquant[name].quantized_codes)
                     else:
-                        # fallback: store quantized raw tensor
                         quantizers[name] = subset[name].weight.data.clone()
                     leanquant[name].free()
                 except Exception:
-                    # if fasterquant fails under this intervention, fallback to storing quantized tensor
                     quantizers[name] = subset[name].weight.data.clone()
 
             for j in range(args.nsamples):
@@ -495,9 +559,7 @@ def llama_sequential(model, dataloader, dev):
 
     return quantizers
 
-
 # ---- rest of file unchanged: llama_eval and __main__ ----
-
 
 @torch.no_grad()
 def llama_eval(model, testenc, dev):
